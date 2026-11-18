@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
@@ -36,8 +37,13 @@ class Dispatcher:
         http_timeout: float = 2.0,
         retry_seconds: float = 1.0,
         reconcile_grace: float = 5.0,
+        recon_store=None,
     ):
         self.store = store
+        # Reconciliation flags: devices with a confirmed discrepancy must not
+        # receive new claims.  Optional so unit tests can construct the
+        # dispatcher without the reconciliation tables.
+        self.recon_store = recon_store
         self.gateway_url = gateway_url.rstrip("/")
         self.tick_seconds = tick_seconds
         self.verify_interval = verify_interval
@@ -78,7 +84,10 @@ class Dispatcher:
         while not self._stop.is_set():
             try:
                 self.store.expire_pending()
-                for row in self.store.claim_batch(retry_seconds=self.retry_seconds):
+                skip = self._flagged_devices()
+                for row in self.store.claim_batch(
+                    retry_seconds=self.retry_seconds, skip_devices=skip
+                ):
                     self._spawn(row["command_id"], self._deliver(row["command_id"]))
                 now = asyncio.get_running_loop().time()
                 for row in self.store.inflight():
@@ -100,6 +109,20 @@ class Dispatcher:
         task = asyncio.create_task(coro, name=f"cmd:{command_id}")
         self._tasks[command_id] = task
         task.add_done_callback(lambda _t, cid=command_id: self._tasks.pop(cid, None))
+
+    def _flagged_devices(self) -> set[str]:
+        """Devices persistently marked 待排查 by reconciliation.
+
+        New commands for these devices are never claimed; inflight commands
+        are unaffected and continue their normal verification path.
+        """
+        if self.recon_store is None:
+            return set()
+        try:
+            return {r["device_id"] for r in self.recon_store.flagged_devices()}
+        except Exception:  # tables not initialised in stripped-down tests
+            log.exception("could not read reconciliation flags")
+            return set()
 
     # --------------------------------------------------------------- delivery
     async def _deliver(self, command_id: str) -> None:

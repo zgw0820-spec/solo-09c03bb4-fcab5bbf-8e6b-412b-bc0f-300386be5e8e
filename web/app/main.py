@@ -10,27 +10,40 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import httpx
+from pydantic import BaseModel
 
 from .dispatcher import Dispatcher
+from .recon_store import (
+    RESULT_DISPLAY,
+    RUN_DISPLAY,
+    ReconciliationStore,
+)
+from .reconciler import Reconciler
 from .store import DISPLAY, CommandIdConflict, Store
 
 DB_PATH = os.environ.get("OPS_DB", "/data/ops.db")
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://gateway:8001")
 
 store = Store(DB_PATH)
+recon_store = ReconciliationStore(DB_PATH)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 dispatcher: Dispatcher | None = None
+reconciler: Reconciler | None = None
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global dispatcher
+    global dispatcher, reconciler
     store.init()
-    dispatcher = Dispatcher(store, GATEWAY_URL)
+    recon_store.init()
+    dispatcher = Dispatcher(store, GATEWAY_URL, recon_store=recon_store)
+    reconciler = Reconciler(store, recon_store, GATEWAY_URL)
     dispatcher.start()
+    reconciler.start()
     try:
         yield
     finally:
+        await reconciler.stop()
         await dispatcher.stop()
 
 
@@ -64,6 +77,10 @@ def index(request: Request):
             "counts": store.counts(),
             "now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "gateway_url": GATEWAY_URL,
+            "flags": recon_store.flagged_devices(),
+            "runs": [_run_to_dict(r) for r in recon_store.list_runs(limit=20)],
+            "run_display": RUN_DISPLAY,
+            "result_display": RESULT_DISPLAY,
         },
     )
 
@@ -157,3 +174,117 @@ def drop_receipt(command_id: str):
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+
+# ==========================================================================
+# Reconciliation (更换网关磁盘后的历史执行记录对账)
+# ==========================================================================
+class ReconRequest(BaseModel):
+    device_id: str
+
+
+def _run_to_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "device_id": row["device_id"],
+        "status": row["status"],
+        "status_label": RUN_DISPLAY.get(row["status"], row["status"]),
+        "snapshot_count": row["snapshot_count"],
+        "checked_count": row["checked_count"],
+        "diff_count": row["diff_count"],
+        "unverified_count": row["unverified_count"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def _item_to_dict(row) -> dict:
+    return {
+        "command_id": row["command_id"],
+        "device_id": row["device_id"],
+        "web_state": row["web_state"],
+        "web_receipt": row["web_receipt"],
+        "result": row["result"],
+        "result_label": RESULT_DISPLAY.get(row["result"], row["result"]),
+        "detail": row["detail"],
+        "gateway_device": row["gateway_device"],
+        "gateway_state": row["gateway_state"],
+        "gateway_status": row["gateway_status"],
+        "checked_at": row["checked_at"],
+    }
+
+
+def _start_recon(device_id: str) -> int:
+    device_id = (device_id or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="设备号不能为空")
+    try:
+        run_id, _count = reconciler.request_run(device_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return run_id
+
+
+@app.post("/reconcile")
+def reconcile_form(device_id: str = Form(...)):
+    run_id = _start_recon(device_id)
+    return RedirectResponse(url=f"/reconcile/runs/{run_id}", status_code=303)
+
+
+@app.post("/api/reconcile")
+def api_start_recon(payload: ReconRequest):
+    run_id = _start_recon(payload.device_id)
+    return {"run_id": run_id, **_run_to_dict(recon_store.get_run(run_id))}
+
+
+@app.get("/reconcile/runs/{run_id}", response_class=HTMLResponse)
+def recon_run_page(request: Request, run_id: int):
+    run = recon_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="对账批次不存在")
+    items = [_item_to_dict(r) for r in recon_store.list_items(run_id)]
+    # Commands confirmed after this run's snapshot are explicitly out of scope:
+    # an old "consistent" finding must never be presented as current truth.
+    new_after_snapshot = recon_store.count_confirmed_since(
+        run["device_id"], run["created_at"]
+    )
+    return templates.TemplateResponse(
+        request,
+        "recon_run.html",
+        {
+            "run": _run_to_dict(run),
+            "items": items,
+            "new_after_snapshot": new_after_snapshot,
+            "flagged": recon_store.is_flagged(run["device_id"]),
+            "result_display": RESULT_DISPLAY,
+        },
+    )
+
+
+@app.get("/api/reconcile/runs/{run_id}")
+def api_recon_run(run_id: int):
+    run = recon_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="对账批次不存在")
+    return {
+        **_run_to_dict(run),
+        "items": [_item_to_dict(r) for r in recon_store.list_items(run_id)],
+        "new_confirmed_after_snapshot": recon_store.count_confirmed_since(
+            run["device_id"], run["created_at"]
+        ),
+        "device_flagged": recon_store.is_flagged(run["device_id"]),
+    }
+
+
+@app.get("/api/reconcile/flags")
+def api_recon_flags():
+    return [dict(r) for r in recon_store.flagged_devices()]
+
+
+@app.post("/api/reconcile/flags/{device_id}/clear")
+def api_clear_flag(device_id: str, reason: str = Form("人工确认后解除待排查标记")):
+    """Manual acknowledgement only; the flag is never auto-cleared."""
+    if not recon_store.clear_flag(device_id, reason.strip() or "人工解除"):
+        raise HTTPException(status_code=404, detail="该设备没有生效中的待排查标记")
+    return {"ok": True, "device_id": device_id}

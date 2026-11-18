@@ -142,6 +142,20 @@ class Store:
                 "SELECT * FROM commands WHERE state='inflight' ORDER BY id"
             ).fetchall()
 
+    def confirmed_for_device(self, device_id: str) -> list[sqlite3.Row]:
+        """Snapshot of commands with a confirmed outcome for one device.
+
+        Only executed/failed commands are in reconciliation scope; pending and
+        inflight commands keep their own verification rules and are excluded.
+        The returned rows fix the audit set at request time.
+        """
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM commands WHERE device_id=? "
+                "AND state IN ('executed','failed') ORDER BY id",
+                (device_id,),
+            ).fetchall()
+
     def counts(self) -> dict[str, int]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -219,12 +233,20 @@ class Store:
             )
             return cur.rowcount
 
-    def claim_batch(self, *, retry_seconds: float = 1.0) -> list[sqlite3.Row]:
+    def claim_batch(
+        self,
+        *,
+        retry_seconds: float = 1.0,
+        skip_devices: Optional[set[str]] = None,
+    ) -> list[sqlite3.Row]:
         """Atomically claim the head of each device queue.
 
         * Expired pending commands become unexecuted (never sent).
         * A device with an inflight command is blocked regardless of that
           command's deadline (outcome unknown => cannot pass it).
+        * A device flagged "待排查" by reconciliation never receives *new*
+          claims.  Commands already inflight (or otherwise pending
+          verification) are untouched and keep their existing rules.
         * Only the oldest eligible pending command per device is claimed, so
           same-device commands run strictly in submission(order) = id order.
         * Different devices are all claimed in the same pass.
@@ -234,6 +256,7 @@ class Store:
             datetime.now(timezone.utc).timestamp() - max(0.0, retry_seconds),
             tz=timezone.utc,
         ).isoformat(timespec="microseconds")
+        flagged = set(skip_devices or ())
 
         with self._tx() as conn:
             conn.execute(
@@ -250,11 +273,15 @@ class Store:
             blocked = {
                 row["device_id"] for row in rows if row["state"] == "inflight"
             }
+            # Reconciliation flags only block *new* dispatch for that device.
+            blocked |= flagged
             claimed: list[sqlite3.Row] = []
             for row in rows:
                 if row["state"] != "pending":
                     continue
                 device = row["device_id"]
+                if device in flagged:
+                    continue
                 if device in blocked:
                     continue
                 if row["last_attempt_at"] and row["last_attempt_at"] > cutoff:

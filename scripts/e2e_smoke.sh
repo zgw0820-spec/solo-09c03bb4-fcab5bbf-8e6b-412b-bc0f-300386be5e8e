@@ -11,7 +11,12 @@
 #   5. gateway outage -> command stays pending, never lost;
 #   6. restart of both services -> unfinished work resumes, nothing re-executed;
 #   7. gateway killed mid-execution -> id frozen as unknown, web keeps it
-#      unresolved and blocks that device; the id is never executed.
+#      unresolved and blocks that device; the id is never executed;
+#   8. post-maintenance reconciliation: clean run is consistent; a gateway
+#      record lost after a disk swap is reported as missing and persistently
+#      flags the device so new commands are never claimed while other devices
+#      run; an unreachable gateway yields "unverified" (never consistent or
+#      missing); flags and findings survive a restart of both services.
 #
 # Expiry rules (unexecuted vs. still-verifying) are covered by pytest at
 # second granularity; the web form only accepts whole minutes.
@@ -154,12 +159,107 @@ echo "resume-1 while gateway down: $(web_state resume-1)"
 echo "-- [6] restart both services"
 stop_web
 start_gateway
+wait_http "http://127.0.0.1:$GW_PORT/healthz"
 start_web
 wait_http "http://127.0.0.1:$WEB_PORT/healthz"
 wait_state resume-1 executed
 echo "resume-1 after restart: $(curl -sS "http://127.0.0.1:$WEB_PORT/api/commands/resume-1")"
 
 sleep 0.5
+
+# ============================================================================
+# [8] Post-maintenance reconciliation (网关换盘后的历史执行记录对账)
+# ============================================================================
+echo "-- [8a] reconciliation: healthy baseline is consistent, no flag"
+submit device-R rec-keep 5 >/dev/null
+submit device-R rec-lose 5 >/dev/null
+wait_state rec-keep executed
+wait_state rec-lose executed
+rec_run=$(curl -sS -X POST "http://127.0.0.1:$WEB_PORT/api/reconcile" \
+  -H 'content-type: application/json' -d '{"device_id":"device-R"}' | field id)
+echo "reconcile run #$rec_run created for device-R"
+for _ in $(seq 1 100); do
+  st=$(curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$rec_run" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['status'])")
+  case "$st" in done_*) break;; esac
+  sleep 0.1
+done
+echo "baseline run status: $st"
+[ "$st" = "done_ok" ] || { echo "expected done_ok, got $st" >&2; exit 1; }
+curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/flags" | grep -q device-R \
+  && { echo "device-R must not be flagged on a clean run" >&2; exit 1; } || true
+
+echo "-- [8b] gateway disk swap: rec-lose record disappears -> missing + flag"
+"$PY" - "$TMP/gateway.db" <<'PYTAMPER'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("DELETE FROM executions WHERE command_id='rec-lose'")
+conn.commit()
+PYTAMPER
+diff_run=$(curl -sS -X POST "http://127.0.0.1:$WEB_PORT/api/reconcile" \
+  -H 'content-type: application/json' -d '{"device_id":"device-R"}' | field id)
+for _ in $(seq 1 100); do
+  st=$(curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$diff_run" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['status'])")
+  case "$st" in done_*) break;; esac
+  sleep 0.1
+done
+echo "diff run status: $st"
+[ "$st" = "done_diff" ] || { echo "expected done_diff, got $st" >&2; exit 1; }
+curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$diff_run" \
+  | "$PY" -c "import json,sys; d=json.load(sys.stdin); i={x['command_id']:x['result'] for x in d['items']}; print(i); assert i=={'rec-keep':'consistent','rec-lose':'missing'}"
+curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/flags" | grep -q device-R \
+  || { echo "device-R must be flagged after discrepancy" >&2; exit 1; }
+
+echo "-- [8c] flagged device: new commands are never claimed, other devices run"
+submit device-R rec-new 5 >/dev/null
+submit device-Q rec-other 5 >/dev/null
+sleep 2
+echo "rec-new on flagged device: $(web_state rec-new) (expect pending)"
+[ "$(web_state rec-new)" = "pending" ] || { echo "flagged device was dispatched!" >&2; exit 1; }
+[ "$(gw_code rec-new)" = "404" ] || { echo "rec-new must never reach gateway" >&2; exit 1; }
+wait_state rec-other executed
+echo "rec-other on another device: $(web_state rec-other) (expect executed)"
+
+echo "-- [8d] gateway unreachable during reconcile -> unverified, not consistent/missing"
+stop_gateway
+down_run=$(curl -sS -X POST "http://127.0.0.1:$WEB_PORT/api/reconcile" \
+  -H 'content-type: application/json' -d '{"device_id":"device-Q"}' | field id)
+for _ in $(seq 1 150); do
+  st=$(curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$down_run" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['status'])")
+  case "$st" in done_*) break;; esac
+  sleep 0.1
+done
+echo "unreachable run status: $st"
+[ "$st" = "done_unverified" ] || { echo "expected done_unverified, got $st" >&2; exit 1; }
+curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$down_run" \
+  | "$PY" -c "import json,sys; d=json.load(sys.stdin); assert d['device_flagged'] is False; assert all(i['result']=='unverified' for i in d['items']); print('unverified items:', len(d['items']))"
+
+echo "-- [8e] restart both services: flag and findings remain visible"
+stop_web
+start_gateway
+wait_http "http://127.0.0.1:$GW_PORT/healthz"
+start_web
+wait_http "http://127.0.0.1:$WEB_PORT/healthz"
+sleep 0.5
+curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/flags" | grep -q device-R \
+  || { echo "device-R flag did not survive restart" >&2; exit 1; }
+curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$diff_run" \
+  | "$PY" -c "import json,sys; d=json.load(sys.stdin); assert d['status']=='done_diff' and d['diff_count']==1; print('diff run persisted after restart')"
+# Still blocked after restart.
+sleep 1.5
+[ "$(web_state rec-new)" = "pending" ] || { echo "flag enforcement lost after restart" >&2; exit 1; }
+echo "rec-new still pending after restart: $(web_state rec-new)"
+
+echo "-- [8f] re-reconcile after gateway recovery resolves the unverified run"
+re_run=$(curl -sS -X POST "http://127.0.0.1:$WEB_PORT/api/reconcile" \
+  -H 'content-type: application/json' -d '{"device_id":"device-Q"}' | field id)
+for _ in $(seq 1 100); do
+  st=$(curl -sS "http://127.0.0.1:$WEB_PORT/api/reconcile/runs/$re_run" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['status'])")
+  case "$st" in done_*) break;; esac
+  sleep 0.1
+done
+echo "recovered run status: $st"
+[ "$st" = "done_ok" ] || { echo "expected done_ok after recovery, got $st" >&2; exit 1; }
+
 echo "-- final states"
 for c in ok-1 ok-2 ok-3 live-1 resume-1 kill-1 kill-2 kill-3; do
   printf '%s=%s ' "$c" "$(web_state "$c")"

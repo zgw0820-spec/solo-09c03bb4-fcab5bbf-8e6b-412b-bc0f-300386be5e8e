@@ -36,6 +36,15 @@
   .detail-grid { display:grid; grid-template-columns: 170px 1fr; gap:10px 16px; font-size:14px; }
   .detail-grid dt { color:#57606a; }
   .detail-grid dd { margin:0; }
+  .r-consistent { background:#dafbe1; color:#116329; }
+  .r-missing { background:#ffebe9; color:#a40e26; }
+  .r-device_conflict, .r-conclusion_conflict { background:#ffebe9; color:#a40e26; }
+  .r-unverified { background:#fff8c5; color:#7d4e00; }
+  .r-pending, .r-running { background:#eaeef2; color:#424a53; }
+  .flag-box { background:#fff1e5; border:1px solid #ff9a5c; border-radius:6px; padding:12px 14px; margin-bottom:16px; font-size:13px; }
+  .flag-box ul { margin:8px 0 0; padding-left:18px; }
+  .recon-form { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+  .recon-form label { display:flex; flex-direction:column; gap:6px; font-size:13px; color:#57606a; flex:1; min-width:240px; }
 </style>
 </head>
 <body>
@@ -66,6 +75,58 @@
 
   <div class="card">
     <div class="toolbar">
+      <strong style="font-size:15px">网关换盘后对账</strong>
+      <span class="muted">逐指令号核对网页已确认（成功/失败）的重启指令</span>
+    </div>
+    {% if flags %}
+    <div class="flag-box">
+      <strong>待排查设备（已持久标记，调度器不再认领其新指令）：</strong>
+      <ul>
+        {% for f in flags %}
+        <li><code>{{ f.device_id }}</code> — {{ f.reason }}（标记于 {{ f.created_at }}）</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    <form class="recon-form" method="post" action="/reconcile">
+      <label>设备号
+        <input type="text" name="device_id" placeholder="edge-rack-01" required>
+      </label>
+      <button type="submit">发起对账</button>
+      <span class="muted">仅核对已确认结论的指令；网关不可达记为“未核实”，不会判为一致或丢失。差异及标记在两服务重启后仍保留。</span>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="toolbar">
+      <strong style="font-size:15px">对账批次</strong>
+      <span class="muted">结论仅代表该批次快照时点</span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>#</th><th>设备号</th><th>状态</th><th>已核对/快照</th><th>差异</th><th>未核实</th><th>创建时间</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for r in runs %}
+        <tr>
+          <td>{{ r.id }}</td>
+          <td><code>{{ r.device_id }}</code></td>
+          <td><span class="badge s-{{ r.status }}">{{ r.status_label }}</span></td>
+          <td>{{ r.checked_count }}/{{ r.snapshot_count }}</td>
+          <td>{{ r.diff_count }}</td>
+          <td>{{ r.unverified_count }}</td>
+          <td class="muted">{{ r.created_at }}</td>
+          <td><a href="/reconcile/runs/{{ r.id }}">查看明细</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted">暂无对账批次</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="toolbar">
       <strong style="font-size:15px">指令列表</strong>
       <span class="muted">页面每 2 秒刷新 · 服务器时间 {{ now }}</span>
     </div>
@@ -76,7 +137,10 @@
       <tbody>
         {% for r in rows %}
         <tr>
-          <td>{{ r.device_id }}</td>
+          <td>{{ r.device_id }}
+              {% if r.device_id in flags | map(attribute='device_id') %}
+              <div class="muted">⚠ 待排查：新指令暂停认领</div>
+              {% endif %}</td>
           <td><a href="/commands/{{ r.command_id }}"><code>{{ r.command_id }}</code></a></td>
           <td><span class="badge s-{{ r.state }}">{{ r.state_label }}</span>
               {% if r.receipt_lost %}<div class="muted">回执丢失，核实中</div>{% endif %}</td>
