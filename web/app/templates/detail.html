@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>指令 {{ cmd.command_id }}</title>
+<style>
+  body { font-family: system-ui, "Noto Sans SC", sans-serif; margin: 0; background:#f5f6f8; color:#1f2328; }
+  main { max-width: 900px; margin: 32px auto; padding: 0 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  a { color:#1f6feb; }
+  .card { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:20px; margin-top:20px; }
+  .detail-grid { display:grid; grid-template-columns: 170px 1fr; gap:12px 16px; font-size:14px; }
+  .detail-grid dt { color:#57606a; }
+  .detail-grid dd { margin:0; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; }
+  .s-pending { background:#eaeef2; color:#424a53; }
+  .s-inflight { background:#fff8c5; color:#7d4e00; }
+  .s-executed { background:#dafbe1; color:#116329; }
+  .s-failed { background:#ffebe9; color:#a40e26; }
+  .s-unexecuted { background:#f6f8fa; color:#6e7781; }
+  .s-rejected { background:#ffebe9; color:#a40e26; }
+  .muted { color:#6e7781; font-size:12px; }
+  .notice { background:#ddf4ff; border:1px solid #54aeff; border-radius:6px; padding:10px 12px; font-size:13px; margin:12px 0; }
+  button { padding:9px 16px; border:0; border-radius:6px; background:#cf222e; color:#fff; font-size:14px; cursor:pointer; }
+  code { background:#f6f8fa; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="/">← 返回指令列表</a></p>
+  <h1>指令 <code>{{ cmd.command_id }}</code></h1>
+  {% if duplicate %}
+  <div class="notice">该指令号此前已提交，这里显示的是原记录；未重复下发、未重复执行。</div>
+  {% endif %}
+  <p class="muted">页面每 2 秒刷新</p>
+
+  <div class="card">
+    <dl class="detail-grid">
+      <dt>设备号</dt><dd>{{ cmd.device_id }}</dd>
+      <dt>状态</dt><dd><span class="badge s-{{ cmd.state }}">{{ cmd.state_label }}</span></dd>
+      <dt>回执状态</dt><dd>{{ cmd.receipt_status or '—' }}</dd>
+      <dt>说明</dt><dd>{{ cmd.detail or '—' }}</dd>
+      <dt>下发尝试次数</dt><dd>{{ cmd.attempts }}</dd>
+      <dt>回执丢失</dt><dd>{{ '是（正在按指令号核实）' if cmd.receipt_lost else '否' }}</dd>
+      <dt>截止时间</dt><dd>{{ cmd.deadline }}</dd>
+      <dt>创建时间</dt><dd>{{ cmd.created_at }}</dd>
+      <dt>更新时间</dt><dd>{{ cmd.updated_at }}</dd>
+    </dl>
+  </div>
+
+  {% if cmd.state in ('pending', 'inflight') %}
+  <div class="card">
+    <form method="post" action="/commands/{{ cmd.command_id }}/drop-receipt">
+      <button type="submit">触发丢回执</button>
+      <span class="muted">让网关完成执行但不返回回执；网页随后按指令号核实，不会重复执行。</span>
+    </form>
+  </div>
+  {% endif %}
+</main>
+<script>
+  const terminal = ['executed','failed','unexecuted','rejected'];
+  if (!terminal.includes('{{ cmd.state }}')) setTimeout(() => window.location.reload(), 2000);
+</script>
+</body>
+</html>

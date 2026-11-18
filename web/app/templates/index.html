@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>机房重启指令下发</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, "Noto Sans SC", sans-serif; margin: 0; background:#f5f6f8; color:#1f2328; }
+  main { max-width: 1100px; margin: 32px auto; padding: 0 20px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  p.lead { color:#57606a; margin: 0 0 24px; font-size: 14px; }
+  .card { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:20px; margin-bottom:24px; }
+  form { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap:12px; align-items:end; }
+  label { display:flex; flex-direction:column; gap:6px; font-size:13px; color:#57606a; }
+  input[type=text], input[type=number] { padding:8px 10px; border:1px solid #d0d7de; border-radius:6px; font-size:14px; }
+  .check { flex-direction:row; align-items:center; gap:6px; padding-bottom:9px; }
+  button { padding:9px 16px; border:0; border-radius:6px; background:#1f6feb; color:#fff; font-size:14px; cursor:pointer; }
+  button.secondary { background:#eaeef2; color:#24292f; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid #eaeef2; vertical-align:top; }
+  th { color:#57606a; font-weight:600; background:#f6f8fa; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .s-pending { background:#eaeef2; color:#424a53; }
+  .s-inflight { background:#fff8c5; color:#7d4e00; }
+  .s-executed { background:#dafbe1; color:#116329; }
+  .s-failed { background:#ffebe9; color:#a40e26; }
+  .s-unexecuted { background:#f6f8fa; color:#6e7781; }
+  .s-rejected { background:#ffebe9; color:#a40e26; }
+  .muted { color:#6e7781; font-size:12px; }
+  .counts { display:flex; gap:10px; flex-wrap:wrap; font-size:13px; color:#57606a; margin-bottom:8px; }
+  .counts span { background:#fff; border:1px solid #d8dee4; padding:4px 10px; border-radius:999px; }
+  .toolbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+  .error { background:#ffebe9; border:1px solid #ff8182; padding:10px 12px; border-radius:6px; font-size:13px; margin-bottom:16px; }
+  code { background:#f6f8fa; padding:1px 5px; border-radius:4px; }
+  .detail-grid { display:grid; grid-template-columns: 170px 1fr; gap:10px 16px; font-size:14px; }
+  .detail-grid dt { color:#57606a; }
+  .detail-grid dd { margin:0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>机房重启指令下发</h1>
+  <p class="lead">同号幂等 · 同设备串行 · 丢回执按指令号核实，绝不重复执行</p>
+
+  <div class="card">
+    <div class="counts">
+      {% for key, label in [('pending','等待下发'),('inflight','已发出待回执'),('executed','成功'),('failed','失败'),('unexecuted','未执行'),('rejected','拒绝')] %}
+        <span>{{ label }}：{{ counts.get(key, 0) }}</span>
+      {% endfor %}
+    </div>
+    <form method="post" action="/commands">
+      <label>设备号
+        <input type="text" name="device_id" placeholder="edge-rack-01" required>
+      </label>
+      <label>指令号
+        <input type="text" name="command_id" placeholder="reboot-0001" required>
+      </label>
+      <label>截止时间（分钟后）
+        <input type="number" name="deadline_minutes" value="30" min="1" max="1440" required>
+      </label>
+      <label class="check"><input type="checkbox" name="drop_receipt" value="true"> 模拟丢回执</label>
+      <button type="submit">提交指令</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="toolbar">
+      <strong style="font-size:15px">指令列表</strong>
+      <span class="muted">页面每 2 秒刷新 · 服务器时间 {{ now }}</span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>设备号</th><th>指令号</th><th>状态</th><th>说明</th><th>尝试</th><th>截止时间</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r.device_id }}</td>
+          <td><a href="/commands/{{ r.command_id }}"><code>{{ r.command_id }}</code></a></td>
+          <td><span class="badge s-{{ r.state }}">{{ r.state_label }}</span>
+              {% if r.receipt_lost %}<div class="muted">回执丢失，核实中</div>{% endif %}</td>
+          <td>{{ r.detail or '' }}</td>
+          <td>{{ r.attempts }}</td>
+          <td class="muted">{{ r.deadline }}</td>
+          <td>
+            {% if r.state in ('pending', 'inflight') %}
+            <form method="post" action="/commands/{{ r.command_id }}/drop-receipt" style="display:inline">
+              <button class="secondary" type="submit">触发丢回执</button>
+            </form>
+            {% else %}<span class="muted">已结案</span>{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="muted">暂无指令</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</main>
+<script>
+  setTimeout(() => window.location.reload(), 2000);
+</script>
+</body>
+</html>
